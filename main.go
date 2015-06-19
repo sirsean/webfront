@@ -55,6 +55,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"github.com/gorilla/websocket"
 )
 
 var (
@@ -65,6 +66,7 @@ var (
 	ruleFile     = flag.String("rules", "", "rule definition file")
 	pollInterval = flag.Duration("poll", time.Second*10, "file poll interval")
 )
+var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
 
 func main() {
 	flag.Parse()
@@ -130,11 +132,106 @@ func NewServer(file string, poll time.Duration) (*Server, error) {
 	return s, nil
 }
 
+type proxySocket struct {
+	internal *websocket.Conn
+	external *websocket.Conn
+	proxyExternal chan []byte
+	proxyInternal chan []byte
+}
+
+func newProxySocket() *proxySocket {
+	return &proxySocket{
+		proxyExternal: make(chan []byte),
+		proxyInternal: make(chan []byte),
+	}
+}
+
+func (s *proxySocket) connect(w http.ResponseWriter, r *http.Request, rule *Rule) (err error) {
+	s.external, err = upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("failed to upgrade websocket: %v", err)
+		return err
+	}
+	url := "ws://" + rule.Forward + r.URL.String()
+	wsHeaders := http.Header{
+		"Origin": {"http://" + r.Host},
+		"Sec-WebSocket-Extensions": {"permessage-deflate; client_max_window_bits, x-webkit-deflate-frame"},
+		"Cookie": {r.Header.Get("Cookie")},
+	}
+	s.internal, _, err = websocket.DefaultDialer.Dial(url, wsHeaders)
+	if err != nil {
+		log.Printf("failed to connect internal: %v", err)
+		return err
+	}
+	return
+}
+
+func (s *proxySocket) Close() {
+	if s.external != nil {
+		s.external.Close()
+	}
+	if s.internal != nil {
+		s.internal.Close()
+	}
+}
+
+func (s *proxySocket) internalWriter() {
+	for msg := range s.proxyInternal {
+		err := s.internal.WriteMessage(websocket.TextMessage, msg)
+		if err != nil {
+			break
+		}
+	}
+}
+
+func (s *proxySocket) internalReader() {
+	for {
+		_, message, err := s.internal.ReadMessage()
+		if err != nil {
+			break
+		}
+		s.proxyExternal <- message
+	}
+}
+
+func (s *proxySocket) externalWriter() {
+	for msg := range s.proxyExternal {
+		err := s.external.WriteMessage(websocket.TextMessage, msg)
+		if err != nil {
+			break
+		}
+	}
+}
+
+func (s *proxySocket) externalReader() {
+	for {
+		_, message, err := s.external.ReadMessage()
+		if err != nil {
+			break
+		}
+		s.proxyInternal <- message
+	}
+}
+
 // ServeHTTP matches the Request with a Rule and, if found, serves the
 // request with the Rule's handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h := s.handler(r); h != nil {
-		h.ServeHTTP(w, r)
+	if rule, h := s.handler(r); h != nil {
+		if r.Header.Get("Upgrade") == "websocket" {
+			socket := newProxySocket()
+			socket.connect(w, r, rule)
+			defer socket.Close()
+			// internal writer
+			go socket.internalWriter()
+			// internal reader
+			go socket.internalReader()
+			// external writer
+			go socket.externalWriter()
+			// external reader
+			socket.externalReader()
+		} else {
+			h.ServeHTTP(w, r)
+		}
 		return
 	}
 	http.Error(w, "Not found.", http.StatusNotFound)
@@ -142,7 +239,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handler returns the appropriate Handler for the given Request,
 // or nil if none found.
-func (s *Server) handler(req *http.Request) http.Handler {
+func (s *Server) handler(req *http.Request) (*Rule, http.Handler) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	h := req.Host
@@ -152,10 +249,10 @@ func (s *Server) handler(req *http.Request) http.Handler {
 	}
 	for _, r := range s.rules {
 		if h == r.Host || strings.HasSuffix(h, "."+r.Host) {
-			return r.handler
+			return r, r.handler
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // refreshRules polls file periodically and refreshes the Server's rule
