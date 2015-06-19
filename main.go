@@ -274,7 +274,7 @@ func (s *Server) loadRules(file string) error {
 		return err
 	}
 	mtime := fi.ModTime()
-	if mtime.Before(s.last) && s.rules != nil {
+	if !mtime.After(s.last) && s.rules != nil {
 		return nil // no change
 	}
 	rules, err := parseRules(file)
